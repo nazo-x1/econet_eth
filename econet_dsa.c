@@ -80,9 +80,7 @@ static u32 en7528_read(struct en7528_priv *priv, u32 reg)
 
 static void en7528_rmw(struct en7528_priv *priv, u32 reg, u32 mask, u32 set)
 {
-	mutex_lock(&priv->reg_mutex);
 	regmap_update_bits(priv->regmap, reg, mask, set);
-	mutex_unlock(&priv->reg_mutex);
 }
 
 static void en7528_set(struct en7528_priv *priv, u32 reg, u32 val)
