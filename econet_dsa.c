@@ -1303,76 +1303,84 @@ static int en7528_sw_setup(struct dsa_switch *ds)
 	ds->assisted_learning_on_cpu_port = true;
 	ds->mtu_enforcement_ingress = true;
 
-	/* Reset the switch */
-	reset_control_assert(priv->rstc);
-	usleep_range(20, 50);
-	reset_control_deassert(priv->rstc);
-	usleep_range(20, 50);
+	dev_info(priv->dev, "setup: begin (bootloader state preserved)\n");
 
-	/* Reset the switch PHYs */
-	en7528_write(priv, MT7530_SYS_CTRL, SYS_CTRL_PHY_RST);
+	/*
+	 * Skip hard reset for now — the bootloader has already brought up the
+	 * switch block and its bus interface.  A full reset can gate the AHB
+	 * clock and make subsequent MMIO accesses hang the CPU core.
+	 *
+	 * TODO: revisit once basic DSA operation is confirmed.
+	 */
 
+	dev_info(priv->dev, "setup: configuring trap frames\n");
 	en7528_trap_frames(priv);
+
+	dev_info(priv->dev, "setup: resetting MIB counters\n");
 	en7528_mib_reset(priv);
 
-	/* Disable flooding on all ports initially */
+	dev_info(priv->dev, "setup: clearing flood masks\n");
 	en7528_clear(priv, MT753X_MFC, BC_FFP_MASK | UNM_FFP_MASK |
 		     UNU_FFP_MASK);
 
+	dev_info(priv->dev, "setup: configuring ports\n");
 	for (int i = 0; i < ds->num_ports; i++) {
-		/* Force link down on all ports until phylink brings them up */
 		en7528_rmw(priv, MT753X_PMCR_P(i),
 			   PMCR_LINK_SETTINGS_MASK | EN7528_FORCE_MODE,
 			   EN7528_FORCE_MODE);
 
-		/* Disable forwarding */
 		en7528_rmw(priv, MT7530_PCR_P(i), PCR_MATRIX_MASK,
 			   PCR_MATRIX_CLR);
 
-		/* Disable learning */
 		en7528_set(priv, MT7530_PSC_P(i), SA_DIS);
 
 		en7528_set(priv, MT7531_DBG_CNT(i), MT7531_DIS_CLR);
 
 		if (dsa_is_cpu_port(ds, i)) {
+			dev_info(priv->dev, "setup: enabling CPU port %d\n", i);
 			en7528_cpu_port_enable(priv, ds, i);
-		} else {
+		} else if (dsa_is_user_port(ds, i)) {
 			en7528_port_disable(ds, i);
 			en7528_rmw(priv, MT7530_PPBV1_P(i), G0_PORT_VID_MASK,
 				   G0_PORT_VID_DEF);
 		}
 
-		/* Consistent egress tag */
 		en7528_rmw(priv, MT7530_PVC_P(i), PVC_EG_TAG_MASK,
 			   PVC_EG_TAG(MT7530_VLAN_EG_CONSISTENT));
 	}
 
-	/* Allow mirroring frames received on the local port */
 	en7528_set(priv, MT753X_AGC, LOCAL_EN);
 
-	/* Flush the FDB table */
+	dev_info(priv->dev, "setup: flushing FDB\n");
 	ret = en7528_fdb_cmd(priv, MT7530_FDB_FLUSH, NULL);
-	if (ret < 0)
+	if (ret < 0) {
+		dev_err(priv->dev, "FDB flush failed: %d\n", ret);
 		return ret;
+	}
 
-	/* Setup VLAN ID 0 for VLAN-unaware bridges */
+	dev_info(priv->dev, "setup: configuring VLAN 0\n");
 	ret = en7528_setup_vlan0(priv);
-	if (ret)
+	if (ret) {
+		dev_err(priv->dev, "VLAN 0 setup failed: %d\n", ret);
 		return ret;
+	}
 
-	/* Setup IRQ */
+	dev_info(priv->dev, "setup: configuring IRQ\n");
 	ret = en7528_setup_irq(priv);
-	if (ret)
+	if (ret) {
+		dev_err(priv->dev, "IRQ setup failed: %d\n", ret);
 		return ret;
+	}
 
-	/* Setup MDIO bus for internal PHYs */
+	dev_info(priv->dev, "setup: registering MDIO bus\n");
 	ret = en7528_setup_mdio(priv);
-	if (ret && priv->irq)
-		en7528_free_irq(priv);
-	if (ret)
+	if (ret) {
+		dev_err(priv->dev, "MDIO setup failed: %d\n", ret);
+		if (priv->irq)
+			en7528_free_irq(priv);
 		return ret;
+	}
 
-	/* Initialise PCS instances */
 	for (int i = 0; i < ds->num_ports; i++) {
 		priv->pcs[i].pcs.ops = &en7528_pcs_ops;
 		priv->pcs[i].pcs.neg_mode = true;
@@ -1380,6 +1388,7 @@ static int en7528_sw_setup(struct dsa_switch *ds)
 		priv->pcs[i].port = i;
 	}
 
+	dev_info(priv->dev, "setup: complete\n");
 	return 0;
 }
 
@@ -1500,6 +1509,16 @@ static int en7528_dsa_probe(struct platform_device *pdev)
 	if (IS_ERR(priv->regmap))
 		return dev_err_probe(&pdev->dev, PTR_ERR(priv->regmap),
 				     "failed to init regmap\n");
+
+	{
+		u32 id = en7528_read(priv, MT7530_CREV);
+
+		dev_info(&pdev->dev,
+			 "switch MMIO ok, chip rev 0x%08x\n", id);
+		if (!id || id == 0xffffffff)
+			return dev_err_probe(&pdev->dev, -ENODEV,
+					     "switch not responding\n");
+	}
 
 	ret = dsa_register_switch(priv->ds);
 	if (ret)
